@@ -1,0 +1,300 @@
+==================
+LOADING DATA
+==================
+
+# METHOD 1
+
+ import spark.implicits._
+ import org.apache.spark.sql._
+
+ def formatRecord(s:String): (Int, String, String, String, String, Int, String, String, String, Int, String, Int, Int, Int, Int, String, String) = 
+ {
+ val sp = s.split(";")
+ (sp(0).toInt, sp(1), sp(2), sp(3), sp(4), sp(5).toInt, sp(6), sp(7), sp(8), sp(9).toInt, sp(10), sp(11).toInt, sp(12).toInt, sp(13).toInt, sp(14).toInt, sp(15), sp(16))
+ }
+
+ val bankdf = sc.textFile("./Documents/Dataset/bank.csv").
+ mapPartitionsWithIndex((idx, itr) => if (idx == 0) itr.drop(1) else itr).
+ map(x => x.replace("\"", "")).collect.
+ map(x => formatRecord(x)).
+ toSeq.toDF("age", "job", "martial", "education", "default", "balance", "housing", "loan", "contact", "day", "month", "duration", "campaign", "pdays", "previous", "poutcome", "y")
+
+ bankdf.createOrReplaceTempView("bank")
+
+# METHOD 2
+ 
+ val bankRDD = sc.textFile("./Data/bank_original.csv").
+ map(_.replace("\"", "").
+ replace(";", ",")
+ )
+ 
+ bankRDD.coalesce(1).saveAsTextFile("./Data/BankClean")
+ 
+ NOTE -> Returns FileAlreadyExistsException exception if file already exists
+
+ val bankDF = spark.read.
+ option("header",true).
+ option("inferSchema",true).
+ csv("./data/BankClean/part-00000")
+
+ bankDF.createOrReplaceTempView("bank")
+ NOTE -> Create a temporary view for SQL queries
+
+=============================================================================
+MARKETING SUCCESS/FAILURE RATE
+=============================================================================
+
+ # METHOD 1
+ (bankDF.where($"y" === "yes").count) / (bankDF.count.toFloat)*100
+ (bankDF.where(col("y") === "no").count) / (bankDF.count.toFloat)*100
+
+
+# METHOD 2
+ spark.sql("""
+ SELECT 
+ ROUND((subscriber.count/all.count)*100, 1) AS success_rate,
+ ROUND((nonsubscriber.count/all.count)*100, 1) AS failure_rate
+ FROM 
+ (SELECT COUNT(*) AS count FROM bank WHERE y='yes') subscriber,
+ (SELECT COUNT(*) AS count FROM bank WHERE y='no') nonsubscriber,
+ (SELECT COUNT(*) AS count FROM bank) all
+ """).show
+
++------------+------------+
+|success_rate|failure_rate|
++------------+------------+
+|        11.7|        88.3|
++------------+------------+
+
+====================================
+AGE OF CUSTOMERS -> MAX / MIN / MEAN 
+====================================
+# METHOD 1
+ bankdf.select(max($"age")).collect()(0)(0)
+ bankdf.select(min($"age")).collect()(0)(0)
+ bankdf.select(avg($"age")).collect()(0)(0)
+
+# METHOD 2
+ spark.sql("""
+ SELECT 
+ MIN(age) AS min_age,
+ MAX(age) AS max_age,
+ ROUND(AVG(age), 1) AS avg_age
+ FROM
+ bank
+ """).show
+
++-------+-------+-------+
+|min_age|max_age|avg_age|
++-------+-------+-------+
+|     18|     95|   40.9|
++-------+-------+-------+
+
+===========================
+AVERAGE / MEDIAN -> BALANCE
+===========================
+METHOD 1
+ bankdf.select(avg($"balance") as ("mean_balance")).show
+ bankdf.agg(expr("percentile(balance, 0.5)") as ("median_balance")).show
+
+METHOD 2
+ spark.sql("""
+ SELECT 
+ ROUND(AVG(balance), 1) AS avg_balance,
+ PERCENTILE_APPROX(balance, 0.5) AS med_balance
+ FROM 
+ bank
+ """).show
+
+=================================================
+IS AGE AS FACTOR FOR SUBSCRIPTION TO DEPOSIT
+=================================================
+ TASK -> Comparison of average age of subscribers vs non-subscribers
+
+ spark.sql("""
+ SELECT
+ y AS subscription,
+ ROUND(AVG(age),1) AS avg_age
+ FROM
+ bank
+ GROUP BY y
+ ORDER BY y DESC
+ """).show
+
++------------+-------+
+|subscription|avg_age|
++------------+-------+
+|         yes|   41.7|
+|          no|   40.8|
++------------+-------+
+
+============================================================
+ IS MARITAL STATUS A FACTOR FOR SUBSCRIPTION TO DEPOSIT
+============================================================
+ TASK -> Comparison of subscriber and non-subscribers count vis-a-vis marital category
+
+ spark.sql("SELECT marital, y, COUNT(*) AS count FROM bank GROUP BY marital, y ORDER BY marital, y DESC").show
+
+ NOTE -> Above strategy does not apply as the dataset is imbalanced towards non-subscribers
+
+ TASK -> Compare overall subscription success rate with subscription rate vis-a-vis marital status 
+
+ spark.sql("""
+ SELECT 
+ ROUND((allsubscribers.count/all.count)*100,1) AS overall_success_rate,
+ ROUND((divorcedsubscribers.count/alldivorced.count)*100,1) AS divorced_success_rate,
+ ROUND((marriedsubscribers.count/allmarried.count)*100,1) AS married_success_rate,
+ ROUND((singlesubscribers.count/allsingle.count)*100,1) AS single_success_rate
+ FROM 
+ (SELECT COUNT(*) AS count FROM bank WHERE y='yes') allsubscribers,
+ (SELECT COUNT(*) AS count FROM bank) all, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='divorced' AND y='yes') divorcedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='divorced') alldivorced, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='married' AND y='yes') marriedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='married') allmarried, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='single' AND y='yes') singlesubscribers, 
+ (SELECT COUNT(*) AS count FROM bank WHERE marital='single') allsingle
+ """).show
+
+ +--------------------+---------------------+--------------------+-------------------+
+|overall_success_rate|divorced_success_rate|married_success_rate|single_success_rate|
++--------------------+---------------------+--------------------+-------------------+
+|                11.7|                 11.9|                10.1|               14.9|
++--------------------+---------------------+--------------------+-------------------+
+
+======================================================================
+ ARE AGE + MARITAL STATUS TOGETHER FACTORS FOR SUBSCRIPTION TO DEPOSIT
+======================================================================
+
+ TASK -> Compare subscription success rate in different age brackets and marital status
+
+ NOTE -> Age bucket: youngadult(upto 40), middleage(40+ to 60), oldage(60+)
+
+ val bankAgeGroupMaritalDF = bankDF.withColumn("age_group",
+ when(col("age")<40,"young_adult").
+ otherwise(when(col("age")>=40 and col("age")<60, "middle_age").
+ otherwise("old"))).
+ select($"marital", $"age_group", $"y")
+
+ bankAgeGroupMaritalDF.createOrReplaceTempView("bankAgeGroupMarital")
+ 
+ SUBTASK -> Marketing success rate in distinct age groups irrespective of marital status
+
+ spark.sql("""SELECT 
+ ROUND((youngadultsubscribers.count/allyoungadult.count)*100, 2) AS youngadult, 
+ ROUND((marriedsubscribers.count/allmarried.count)*100, 2) AS middleage, 
+ ROUND((oldsubscribers.count/allold.count)*100, 2) AS old FROM
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE y='yes' AND age_group='young_adult') youngadultsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE age_group='young_adult') allyoungadult, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE y='yes' AND age_group='middle_age') marriedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE age_group='middle_age') allmarried, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE y='yes' AND age_group='old') oldsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE age_group='old') allold""").show
+
+ SUBTASK -> Marketing success rate in distinct age groups for married customers
+
+ spark.sql("""SELECT 
+ ROUND((youngadultmarriedsubscribers.count/allyoungadultmarried.count)*100, 2) AS youngadult_married, 
+ ROUND((middleagemarriedsubscribers.count/allmiddleagemarried.count)*100, 2) AS middleage_married, 
+ ROUND((oldmarriedsubscribers.count/alloldmarried.count)*100, 2) AS old_married FROM 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND y='yes' AND age_group='young_adult') youngadultmarriedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND age_group='young_adult') allyoungadultmarried, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND y='yes' AND age_group='middle_age') middleagemarriedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND age_group='middle_age') allmiddleagemarried, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND y='yes' AND age_group='old') oldmarriedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='married' AND age_group='old') alloldmarried""").show
+
+ TASK -> Marketing success rate  in distinct age groups for divorced customers
+
+ spark.sql("""SELECT
+ ROUND((youngadultdivorcedsubscribers.count/allyoungadultdivorced.count)*100,2) AS youngadult_divorced, 
+ ROUND((middleagedivorcedsubscribers.count/allmiddleagedivorced.count)*100,2) AS middleage_divorced, 
+ ROUND((olddivorcedsubscribers.count/allolddivorced.count)*100,2) AS oldage_divorced FROM 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='young_adult' AND y='yes') youngadultdivorcedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='young_adult') allyoungadultdivorced, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='middle_age' AND y='yes') middleagedivorcedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='middle_age') allmiddleagedivorced, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='old' AND y='yes') olddivorcedsubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='divorced' AND age_group='old') allolddivorced""").show
+
+
+
+ TASK -> Marketing success rate in distinct age groups for single customers
+
+ spark.sql("""SELECT 
+ ROUND((youngadultsinglesubscribers.count/allyoungadultsingle.count)*100,2) AS youngadult_single, 
+ ROUND((middleagesinglesubscribers.count/allmiddleagesingle.count)*100,2) AS middleage_single, 
+ ROUND((oldsinglesubscribers.count/alloldsingle.count)*100,2) AS oldage_single FROM 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='young_adult' AND y='yes') youngadultsinglesubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='young_adult') allyoungadultsingle, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='middle_age' AND y='yes') middleagesinglesubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='middle_age') allmiddleagesingle, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='old' AND y='yes') oldsinglesubscribers, 
+ (SELECT COUNT(*) AS count FROM bankAgeGroupMarital WHERE marital='single' AND age_group='old') alloldsingle
+ """).show
+
+ +----------+---------+------+
+ |youngadult|middleage|oldage|
+ +----------+---------+------+
+ |     12.16|     9.21| 33.63|
+ +----------+---------+------+
+ 
+ +-----------------+----------------+-------------+
+ |youngadult_single|middleage_single|oldage_single|
+ +-----------------+----------------+-------------+
+ |            15.56|           11.88|        21.31|
+ +-----------------+----------------+-------------+
+ 
+ +-------------------+------------------+---------------+
+ |youngadult_divorced|middleage_divorced|oldage_divorced|
+ +-------------------+------------------+---------------+
+ |              10.56|             10.14|          38.94|
+ +-------------------+------------------+---------------+
+
+ +------------------+-----------------+--------------+
+ |youngadult_married|middleage_married|oldage_married|
+ +------------------+-----------------+--------------+
+ |              9.21|             8.59|         33.03|
+ +------------------+-----------------+--------------+
+
+ NOTE -> From above figures, we conclude that (old + married or divorced) customers give significantly higher positive reponse to subscription deposit scheme.
+
+
+============================================================
+FEATURE ENGINEERING -> RIGHT AGE EFFECT FOR TARGET MARKETING
+============================================================
+
+ TASK -> Compare success rate in various age brackets
+ 
+ val minAge = bankDF.select(min($"age")).collect()(0)(0).asInstanceOf[Int]
+
+ val maxAge = bankDF.select(max($"age")).collect()(0)(0).asInstanceOf[Int]
+
+ var age = minAge
+
+scala.math.BigDecimal
+
+ while (age < maxAge) {
+    println(age + " - " + (age + 5) + " -> " +   BigDecimal(bankDF.where($"age" >= age and $"age" < age+5 and $"y" === "yes").count / bankDF.where($"age" >= age and $"age" < age+5).count.toFloat*100).setScale(2, BigDecimal.RoundingMode.HALF_UP).toDouble)
+
+    age = age + 5
+ }
+
+ 18 - 23 -> 31.15
+ 23 - 28 -> 18.21
+ 28 - 33 -> 12.12
+ 33 - 38 -> 10.56
+ 38 - 43 -> 9.27
+ 43 - 48 -> 9.23
+ 48 - 53 -> 8.73
+ 53 - 58 -> 9.5
+ 58 - 63 -> 15.17
+ 63 - 68 -> 40.67
+ 68 - 73 -> 41.11
+ 73 - 78 -> 45.92
+ 78 - 83 -> 40.98
+ 83 - 88 -> 44.9
+ 88 - 93 -> 44.44
+ 93 - 98 -> 60.0
+ 
+ NOTE -> Customers above age 60 show highest propensity for subscription to deposit scheme.
